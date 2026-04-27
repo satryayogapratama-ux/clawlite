@@ -60,6 +60,11 @@ analytics  = Analytics(state_path=str(DB_DIR / "clawlite_proxy_analytics.json"),
 
 app = Flask(__name__)
 
+# ─── Uptime tracking ──────────────────────────────────────────────────────────
+
+START_TIME = time.time()
+VERSION = "1.1.0"
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _extract_query(messages: list[dict]) -> str:
@@ -91,8 +96,8 @@ def _make_cache_response(cached_text: str, model: str, req_id: str) -> dict:
     }
 
 
-def _forward_to_anthropic(payload: dict, headers: dict) -> requests.Response:
-    """Forward request to real Anthropic API."""
+def _forward_to_anthropic(payload: dict, headers: dict, max_retries: int = 3) -> requests.Response:
+    """Forward request to real Anthropic API with exponential backoff retry logic."""
     # Case-insensitive header lookup
     def _h(key):
         return headers.get(key) or headers.get(key.lower()) or headers.get(key.title()) or headers.get(key.upper())
@@ -116,22 +121,60 @@ def _forward_to_anthropic(payload: dict, headers: dict) -> requests.Response:
 
     streaming = payload.get("stream", False)
 
-    resp = requests.post(
-        f"{UPSTREAM}/v1/messages",
-        json=payload,
-        headers=upstream_headers,
-        stream=streaming,
-        timeout=(10, 300),  # connect 10s, read 300s
-    )
-    return resp
+    # Exponential backoff: 1s, 2s, 4s
+    backoff_times = [1, 2, 4]
+    retryable_status_codes = {429, 503, 529}
+    retryable_exceptions = (requests.ConnectionError, requests.Timeout)
+
+    for attempt in range(max_retries + 1):
+        try:
+            resp = requests.post(
+                f"{UPSTREAM}/v1/messages",
+                json=payload,
+                headers=upstream_headers,
+                stream=streaming,
+                timeout=(10, 300),  # connect 10s, read 300s
+            )
+
+            # Check for retryable HTTP status codes
+            if resp.status_code in retryable_status_codes and attempt < max_retries:
+                backoff = backoff_times[attempt]
+                if resp.status_code == 529:
+                    log.warning(f"Anthropic overloaded (529) — retrying in {backoff}s (attempt {attempt + 1}/{max_retries})")
+                else:
+                    log.warning(f"Anthropic returned {resp.status_code} — retrying in {backoff}s (attempt {attempt + 1}/{max_retries})")
+                time.sleep(backoff)
+                continue
+
+            # Do NOT retry on client errors (400, 401, 403, 404, etc)
+            if 400 <= resp.status_code < 500:
+                return resp
+
+            return resp
+
+        except retryable_exceptions as e:
+            if attempt < max_retries:
+                backoff = backoff_times[attempt]
+                log.warning(f"Upstream connection error ({type(e).__name__}) — retrying in {backoff}s (attempt {attempt + 1}/{max_retries})")
+                time.sleep(backoff)
+                continue
+            else:
+                raise
+
+    # Should not reach here, but just in case
+    raise requests.ConnectionError("Max retries exceeded for upstream Anthropic API")
 
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
 
 @app.route("/health", methods=["GET"])
 def health():
+    uptime_seconds = int(time.time() - START_TIME)
     return jsonify({
         "status": "ok",
+        "version": VERSION,
+        "proxy_status": "ok",
+        "uptime_seconds": uptime_seconds,
         "cache_entries": cache.stats()["total_entries"],
         "analytics": analytics.summary(),
     })
@@ -160,7 +203,13 @@ def messages():
     query = _extract_query(messages_list)
     if not query:
         # No user message — pass through directly
-        resp = _forward_to_anthropic(body, dict(request.headers))
+        try:
+            resp = _forward_to_anthropic(body, dict(request.headers))
+        except requests.ConnectionError as e:
+            return jsonify({"error": f"upstream connection error: {e}"}), 502
+        except requests.Timeout:
+            return jsonify({"error": "upstream timeout"}), 504
+
         return Response(resp.content, status=resp.status_code,
                        content_type=resp.headers.get("content-type", "application/json"))
 
@@ -205,7 +254,7 @@ def messages():
     if compressed_system_parts:
         final_payload["system"] = "\n".join(compressed_system_parts)
 
-    # 6. Forward to Anthropic
+    # 6. Forward to Anthropic with retry logic
     try:
         upstream_resp = _forward_to_anthropic(final_payload, dict(request.headers))
     except requests.Timeout:
@@ -213,13 +262,33 @@ def messages():
     except requests.ConnectionError as e:
         return jsonify({"error": f"upstream connection error: {e}"}), 502
 
-    # 7. For streaming, pass through directly
+    # Handle 529 gracefully
+    if upstream_resp.status_code == 529:
+        log.warning(f"Anthropic overloaded (529) after retries — returning error to client")
+        return jsonify({
+            "error": {
+                "type": "overloaded_error",
+                "message": "Anthropic API is overloaded, please try again later"
+            },
+            "retry_after": 60
+        }), 529
+
+    # 7. For streaming, pass through with error handling
     if is_streaming:
         analytics.record(query=query, model=routed_model, compressed=compress_result.summary_added,
                         tokens_saved_compress=tokens_saved_compress)
+
         def generate():
-            for chunk in upstream_resp.iter_content(chunk_size=None):
-                yield chunk
+            try:
+                for chunk in upstream_resp.iter_content(chunk_size=None):
+                    if chunk:
+                        yield chunk
+                # Ensure clean close
+                yield b"data: [DONE]\n\n"
+            except Exception as e:
+                log.error(f"Stream generation error: {e}")
+                yield b"data: [DONE]\n\n"
+
         return Response(stream_with_context(generate()),
                        status=upstream_resp.status_code,
                        content_type=upstream_resp.headers.get("content-type", "text/event-stream"))
@@ -231,7 +300,8 @@ def messages():
 
     try:
         resp_json = upstream_resp.json()
-    except Exception:
+    except Exception as e:
+        log.error(f"Failed to parse upstream response: {e}")
         return Response(upstream_resp.content, status=200, content_type="application/json")
 
     # Extract text for caching
@@ -265,15 +335,13 @@ def messages():
     return jsonify(resp_json)
 
 
-
-
-
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    log.info(f"ClawLite Proxy starting on port {PORT}")
+    log.info(f"ClawLite Proxy v{VERSION} starting on port {PORT}")
     log.info(f"Cache DB: {DB_DIR}/clawlite_proxy_cache.db")
     log.info(f"Similarity threshold: {SIMILARITY} | Max context: {MAX_CTX} tokens")
     log.info(f"Streaming: supported (cache disabled for stream) | Budget: {'$'+str(DAILY_BUDGET) if DAILY_BUDGET else 'unlimited'}")
+    log.info(f"Retry logic: enabled (max 3 retries, exponential backoff 1s/2s/4s)")
 
     app.run(host="127.0.0.1", port=PORT, threaded=True, debug=False)
