@@ -74,10 +74,13 @@ class Analytics:
         }
 
     def _save(self):
-        self.state_path.write_text(json.dumps({
+        import os
+        tmp = self.state_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({
             "totals": self._totals,
             "last_updated": time.time(),
         }, indent=2))
+        os.replace(tmp, self.state_path)  # atomic write
 
     def token_cost(self, tokens: int, model: str) -> float:
         price = MODEL_PRICING.get(model.lower(), MODEL_PRICING[DEFAULT_MODEL])

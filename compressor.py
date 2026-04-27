@@ -119,13 +119,21 @@ class ContextCompressor:
                 summary_added=False,
             )
 
-        # Split: old messages (compress) + recent (keep verbatim)
-        if len(non_system) <= self.keep_recent:
-            recent = non_system
-            old = []
-        else:
-            old = non_system[:-self.keep_recent]
-            recent = non_system[-self.keep_recent:]
+        # Split: keep recent messages within token budget, compress the rest
+        # Cap by tokens, not message count — one long message can blow the budget
+        recent = []
+        recent_tokens = 0
+        for m in reversed(non_system):
+            mt = m.token_estimate()
+            if recent_tokens + mt <= self.max_tokens * 0.6:  # 60% budget for recent
+                recent.insert(0, m)
+                recent_tokens += mt
+            elif len(recent) < 2:  # always keep at least last 2
+                recent.insert(0, m)
+                recent_tokens += mt
+            else:
+                break
+        old = [m for m in non_system if m not in recent]
 
         # Compress old messages into summary
         summary_parts = []

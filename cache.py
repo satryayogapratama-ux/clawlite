@@ -91,8 +91,9 @@ class SemanticCache:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_expires ON cache(expires_at)")
             conn.commit()
 
-    def _hash(self, query: str) -> str:
-        return hashlib.md5(query.strip().lower().encode()).hexdigest()
+    def _hash(self, query: str, tenant: str = "default") -> str:
+        key = f"{tenant}:{query.strip().lower()}"
+        return hashlib.sha256(key.encode()).hexdigest()[:32]
 
     def _embed(self, text: str) -> Optional[bytes]:
         model = _get_model(self.embed_model_name)
@@ -112,10 +113,10 @@ class SemanticCache:
     def _is_expired(self, expires_at: float) -> bool:
         return expires_at > 0 and time.time() > expires_at
 
-    def get(self, query: str) -> CacheResult:
+    def get(self, query: str, tenant: str = "default") -> CacheResult:
         """Look up query. Returns CacheResult with hit=True if found."""
         now = time.time()
-        query_hash = self._hash(query)
+        query_hash = self._hash(query, tenant)
 
         with sqlite3.connect(self.db_path) as conn:
             # Layer 1: exact match
@@ -161,12 +162,12 @@ class SemanticCache:
         return CacheResult(hit=False)
 
     def set(self, query: str, response: str, model: str = "",
-            tokens_used: int = 0, ttl: float = None) -> bool:
+            tokens_used: int = 0, ttl: float = None, tenant: str = "default") -> bool:
         """Store a query-response pair."""
         if ttl is None:
             ttl = self.default_ttl
 
-        query_hash = self._hash(query)
+        query_hash = self._hash(query, tenant)
         expires_at = time.time() + ttl if ttl > 0 else 0
         embedding = self._embed(query)
 
